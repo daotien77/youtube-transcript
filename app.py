@@ -1,5 +1,6 @@
 import streamlit as st
 import streamlit.components.v1 as components
+import json
 from transcript import lay_ma_video, lay_transcript
 
 
@@ -18,27 +19,91 @@ def tao_nut_copy(van_ban: str):
     """
     Hiển thị nút Copy sử dụng HTML + JavaScript.
     Khi bấm, nội dung van_ban được copy vào clipboard của trình duyệt.
-    """
-    # Escape ký tự đặc biệt để tránh lỗi khi nhúng vào JS string
-    van_ban_escaped = van_ban.replace("\\", "\\\\").replace("`", "\\`")
 
-    html_code = f"""
-    <button onclick="
-        navigator.clipboard.writeText(`{van_ban_escaped}`).then(() => {{
-            this.innerText = '✅ Đã copy!';
-            setTimeout(() => this.innerText = '📋 Copy transcript', 2000);
-        }});
-    " style="
-        padding: 8px 16px;
-        font-size: 14px;
-        background-color: #4CAF50;
-        color: white;
-        border: none;
-        border-radius: 6px;
-        cursor: pointer;
-    ">📋 Copy transcript</button>
+    Cách hoạt động:
+    - Sử dụng Clipboard API hiện đại (navigator.clipboard.writeText) 
+    - Có fallback dùng execCommand cho trình duyệt cũ
+    - Hiển thị thông báo thành công/thất bại
     """
-    components.html(html_code, height=50)
+    van_ban_json = json.dumps(van_ban)
+
+    html_code = """
+    <div style="margin: 10px 0;">
+        <button id="copyBtn" style="
+            padding: 10px 20px;
+            font-size: 14px;
+            background: linear-gradient(135deg, #4CAF50, #45a049);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        ">
+            <span id="copyIcon">📋</span>
+            <span>Copy transcript</span>
+        </button>
+    </div>
+
+    <script>
+        const copyBtn = document.getElementById('copyBtn');
+        const copyIcon = document.getElementById('copyIcon');
+        const originalText = copyBtn.innerHTML;
+        const textToCopy = """ + van_ban_json + """;
+
+        copyBtn.addEventListener('click', async function() {
+            copyBtn.disabled = true;
+            copyIcon.textContent = '⏳';
+            
+            try {
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(textToCopy);
+                    copyBtn.innerHTML = '<span id="copyIcon">✅</span><span>Đã copy!</span>';
+                } else {
+                    throw new Error('clipboard not supported');
+                }
+            } catch (err) {
+                // Fallback: sử dụng textarea ẩn
+                try {
+                    const textarea = document.createElement('textarea');
+                    textarea.value = textToCopy;
+                    textarea.style.position = 'fixed';
+                    textarea.style.left = '-9999px';
+                    document.body.appendChild(textarea);
+                    textarea.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(textarea);
+                    copyBtn.innerHTML = '<span id="copyIcon">✅</span><span>Đã copy!</span>';
+                } catch (fallbackErr) {
+                    copyBtn.innerHTML = '<span id="copyIcon">❌</span><span>Không copy được!</span>';
+                }
+            }
+            
+            setTimeout(() => {
+                copyBtn.innerHTML = originalText;
+                copyBtn.disabled = false;
+            }, 2000);
+        });
+
+        copyBtn.addEventListener('mouseenter', function() {
+            if (!copyBtn.disabled) {
+                copyBtn.style.transform = 'translateY(-2px)';
+                copyBtn.style.boxShadow = '0 4px 8px rgba(0,0,0,0.3)';
+            }
+        });
+
+        copyBtn.addEventListener('mouseleave', function() {
+            copyBtn.style.transform = 'translateY(0)';
+            copyBtn.style.boxShadow = '0 2px 4px rgba(0,0,0,0.2)';
+        });
+    </script>
+    """
+
+    components.html(html_code, height=80)
 
 
 # 1. Tiêu đề ứng dụng
