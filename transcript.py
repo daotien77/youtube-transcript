@@ -1,16 +1,11 @@
 import sys
+import json
+import subprocess
+import tempfile
+import os
+import re
 from urllib.parse import urlparse, parse_qs
-from youtube_transcript_api import (
-    YouTubeTranscriptApi,
-    TranscriptsDisabled,
-    NoTranscriptFound,
-    VideoUnavailable,
-    RequestBlocked,
-    IpBlocked,
-    YouTubeRequestFailed,
-)
 
-# Đảm bảo in tiếng Việt trên console Windows không bị lỗi font (cp1252)
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
@@ -27,22 +22,24 @@ def lay_ma_video(url: str) -> str:
     if not url:
         raise ValueError("Vui lòng nhập đường link YouTube.")
 
-    # Thêm https:// nếu người dùng chỉ nhập youtube.com/watch?v=...
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
     parsed = urlparse(url)
 
-    # 1. Kiểm tra domain: chỉ chấp nhận youtube.com hoặc www.youtube.com
     domain = (parsed.netloc or "").lower()
-    if domain not in ("www.youtube.com", "youtube.com"):
+    if domain not in ("www.youtube.com", "youtube.com", "youtu.be", "m.youtube.com"):
         raise ValueError("Link không hợp lệ. Chỉ hỗ trợ link từ domain youtube.com")
 
-    # 2. Kiểm tra đường dẫn: chỉ chấp nhận /watch
-    if parsed.path != "/watch":
+    if parsed.path != "/watch" and domain in ("www.youtube.com", "youtube.com", "m.youtube.com"):
         raise ValueError("Link không hợp lệ. Link phải có dạng https://www.youtube.com/watch?v=...")
 
-    # 3. Lấy tham số 'v' từ chuỗi truy vấn (query string)
+    if domain == "youtu.be":
+        video_id = parsed.path.lstrip("/")
+        if not video_id:
+            raise ValueError("Link không hợp lệ. Không tìm thấy mã video.")
+        return video_id
+
     params = parse_qs(parsed.query)
     danh_sach_v = params.get("v")
 
@@ -52,71 +49,128 @@ def lay_ma_video(url: str) -> str:
     return danh_sach_v[0].strip()
 
 
+def _parse_vtt(content: str) -> list[dict]:
+    """Parse nội dung VTT thành danh sách các đoạn."""
+    segments = []
+    lines = content.split('\n')
+    i = 0
+
+    while i < len(lines):
+        line = lines[i].strip()
+
+        time_pattern = re.search(r'(\d+:)?(\d+):(\d+)\.(\d+)\s*-->\s*(\d+:)?(\d+):(\d+)\.(\d+)', line)
+        if time_pattern:
+            start_match = time_pattern.group(1)
+            start_min = int(time_pattern.group(2))
+            start_sec = int(time_pattern.group(3))
+            start_ms = int(time_pattern.group(4))
+
+            if start_match:
+                start_min += int(start_match.rstrip(':')) * 60
+
+            start_time = start_min * 60 + start_sec + start_ms / 1000.0
+
+            text_parts = []
+            i += 1
+            while i < len(lines):
+                next_line = lines[i].strip()
+                if not next_line or next_line == 'WEBVTT' or re.search(r'\d+:\d+:\d+', next_line):
+                    break
+                text_parts.append(next_line)
+                i += 1
+
+            text = ' '.join(text_parts).strip()
+            if text:
+                segments.append({"start": start_time, "text": text})
+        else:
+            i += 1
+
+    return segments
+
+
 def lay_transcript(video_id: str) -> list[dict]:
     """
     Nhận mã video, lấy danh sách phụ đề có sẵn (ưu tiên tiếng Anh).
     Trả về danh sách các đoạn gồm thời gian bắt đầu ('start') và nội dung ('text').
+    Sử dụng yt-dlp để tránh bị YouTube chặn IP server.
     """
-    api = YouTubeTranscriptApi()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        subtitle_file = os.path.join(tmpdir, "subtitle.vtt")
 
-    try:
-        # Lấy danh sách tất cả các phụ đề có sẵn của video
-        transcript_list = api.list(video_id)
-
-        # Ưu tiên tìm phụ đề tiếng Anh (en, en-US, en-GB, ...)
         try:
-            transcript = transcript_list.find_transcript(["en", "en-US", "en-GB"])
-        except NoTranscriptFound:
-            # Nếu không có tiếng Anh, lấy phụ đề có sẵn đầu tiên
-            transcript = next(iter(transcript_list), None)
-            if transcript is None:
-                raise ValueError("Video không có phụ đề.")
+            cmd = [
+                "yt-dlp",
+                "--write-subs",
+                "--sub-langs", "en",
+                "--skip-download",
+                "-o", os.path.join(tmpdir, "video.%(ext)s"),
+                f"https://www.youtube.com/watch?v={video_id}"
+            ]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                cwd=tmpdir
+            )
 
-        # Tải dữ liệu phụ đề về máy
-        du_lieu = transcript.fetch()
+            vtt_files = []
+            for f in os.listdir(tmpdir):
+                if f.endswith('.vtt'):
+                    vtt_files.append(os.path.join(tmpdir, f))
 
-        # Chuẩn hóa về danh sách các từ điển (dictionary) đơn giản
-        ket_qua = []
-        for snippet in du_lieu.snippets:
-            ket_qua.append({
-                "start": snippet.start,
-                "text": snippet.text,
-            })
-        return ket_qua
+            if not vtt_files:
+                cmd_vi = cmd.copy()
+                cmd_vi[cmd_vi.index("--sub-langs")] = "--sub-langs"
+                cmd_vi[cmd_vi.index("en")] = "vi"
+                result = subprocess.run(
+                    cmd_vi,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    cwd=tmpdir
+                )
 
-    except (TranscriptsDisabled, NoTranscriptFound) as e:
-        raise ValueError(
-            f"Video không có phụ đề.\n"
-            f"   Tên lớp lỗi thật: {type(e).__name__}\n"
-            f"   Nội dung lỗi gốc: {e}"
-        ) from e
-    except VideoUnavailable as e:
-        raise ValueError(
-            f"Video không tồn tại hoặc đã bị xóa / chuyển sang chế độ riêng tư.\n"
-            f"   Tên lớp lỗi thật: {type(e).__name__}\n"
-            f"   Nội dung lỗi gốc: {e}"
-        ) from e
-    except (RequestBlocked, IpBlocked) as e:
-        raise ConnectionError(
-            f"Không kết nối được do bị YouTube chặn. Vui lòng thử lại sau.\n"
-            f"   Tên lớp lỗi thật: {type(e).__name__}\n"
-            f"   Nội dung lỗi gốc: {e}"
-        ) from e
-    except YouTubeRequestFailed as e:
-        raise ConnectionError(
-            f"Không kết nối được với YouTube (lỗi mạng hoặc máy chủ YouTube phản hồi lỗi).\n"
-            f"   Tên lớp lỗi thật: {type(e).__name__}\n"
-            f"   Nội dung lỗi gốc: {e}"
-        ) from e
-    except Exception as e:
-        # Nếu đã là lỗi có chủ đích thì truyền tiếp, ngược lại bọc thông báo rõ ràng
-        if isinstance(e, (ValueError, ConnectionError)):
-            raise e
-        raise RuntimeError(
-            f"Lỗi khi lấy phụ đề: {str(e)}\n"
-            f"   Tên lớp lỗi thật: {type(e).__name__}\n"
-            f"   Nội dung lỗi gốc: {e}"
-        ) from e
+                vtt_files = []
+                for f in os.listdir(tmpdir):
+                    if f.endswith('.vtt'):
+                        vtt_files.append(os.path.join(tmpdir, f))
+
+            if not vtt_files:
+                raise ValueError("Video không có phụ đề hoặc không thể truy xuất phụ đề.")
+
+            with open(vtt_files[0], 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            segments = _parse_vtt(content)
+
+            if not segments:
+                raise ValueError("Không thể phân tích nội dung phụ đề.")
+
+            return segments
+
+        except subprocess.TimeoutExpired:
+            raise ConnectionError(
+                "Không kết nối được do bị YouTube chặn hoặc quá thời gian chờ.\n"
+                "   Tên lớp lỗi: TimeoutExpired"
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                "yt-dlp chưa được cài đặt trên máy chủ.\n"
+                "   Vui lòng cài đặt: pip install yt-dlp"
+            )
+        except Exception as e:
+            error_msg = str(e)
+            if "RequestBlocked" in error_msg or "blocked" in error_msg.lower():
+                raise ConnectionError(
+                    f"Không kết nối được do bị YouTube chặn. Vui lòng thử lại sau.\n"
+                    f"   Tên lớp lỗi thật: RequestBlocked\n"
+                    f"   Nội dung lỗi gốc: {e}"
+                )
+            raise RuntimeError(
+                f"Lỗi khi lấy phụ đề: {e}\n"
+                f"   Tên lớp lỗi thật: {type(e).__name__}"
+            ) from e
 
 
 if __name__ == "__main__":
